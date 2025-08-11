@@ -1,9 +1,10 @@
 # streamlit_dashboard.py
 # -*- coding: utf-8 -*-
 """
-KPI-Dashboard (robuster Filter-Block)
-- Fix: Widgets werden mit sicheren Defaults initialisiert
-- Fix: Zeitraum wird auf Datenbereich begrenzt
+KPI-Dashboard (robust gegen leere Filterergebnisse)
+- Überspringt Charts, wenn keine Daten im Zeitraum/Filter vorhanden
+- Setzt sichere Defaults für Widgets
+- Zeitraum wird auf Datenbereich begrenzt
 """
 from __future__ import annotations
 import io
@@ -111,7 +112,10 @@ def kpi_block(df_curr: pd.DataFrame, df_prev: pd.DataFrame):
     c1.metric("Umsatz", fmt_chf(revenue_curr), f"{delta_pct(revenue_curr, revenue_prev):+.1f}%")
     c2.metric("Bestellungen", f"{orders_curr:,}".replace(",", "'"), f"{delta_pct(orders_curr, orders_prev):+.1f}%")
     c3.metric("Ø Bestellung", fmt_chf(aov_curr), f"{delta_pct(aov_curr, aov_prev):+.1f}%")
-    c4.metric("Periode", f"{df_curr['date'].min().date()} – {df_curr['date'].max().date()}")
+    if not df_curr.empty:
+        c4.metric("Periode", f"{df_curr['date'].min().date()} – {df_curr['date'].max().date()}")
+    else:
+        c4.metric("Periode", "keine Daten")
 
 # ------------------------------ App-Logik -------------------------------------
 st.sidebar.header("Datenquelle")
@@ -159,12 +163,10 @@ regions_all = sorted(df_raw["region"].dropna().astype(str).unique().tolist()) if
 categories_all = sorted(df_raw["category"].dropna().astype(str).unique().tolist()) if "category" in df_raw.columns else []
 channels_all = sorted(df_raw["channel"].dropna().astype(str).unique().tolist()) if "channel" in df_raw.columns else []
 
-# Widgets mit Defaults
 regions = st.sidebar.multiselect("Region", options=regions_all, default=regions_all) if regions_all else []
 categories = st.sidebar.multiselect("Kategorie", options=categories_all, default=categories_all) if categories_all else []
 channels = st.sidebar.multiselect("Kanal", options=channels_all, default=channels_all) if channels_all else []
 
-# Falls Widgets leer (z. B. nach Clear), wieder auf "alle"
 if not regions and regions_all:
     regions = regions_all
 if not categories and categories_all:
@@ -172,62 +174,91 @@ if not categories and categories_all:
 if not channels and channels_all:
     channels = channels_all
 
-# Vorperiode
+# ------------------------------ Daten / Vorperiode ----------------------------
+df_curr = filter_df(df_raw, d_from, d_to, regions, categories, channels)
+
 period_len = max(1, (d_to - d_from).days + 1)
 prev_to = d_from - timedelta(days=1)
 prev_from = prev_to - timedelta(days=period_len - 1)
-
-# ------------------------------ Daten / Charts --------------------------------
-df_curr = filter_df(df_raw, d_from, d_to, regions, categories, channels)
 df_prev = filter_df(df_raw, prev_from, prev_to, regions, categories, channels)
 
 st.title("KPI-Dashboard")
 
+# KPI-Block
 kpi_block(df_curr, df_prev)
 
+# ------------------------------ Tabs -----------------------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["Zeit", "Kategorien", "Kanäle", "Tabelle"])
 
 with tab1:
-    ts = df_curr.groupby(pd.Grouper(key="date", freq="MS"), as_index=False).agg({"revenue":"sum","orders":"sum"})
-    fig = px.line(ts, x="date", y="revenue", markers=True, title="Umsatz über Zeit")
-    fig.update_layout(yaxis_title="Umsatz (CHF)", xaxis_title="Monat")
-    st.plotly_chart(fig, use_container_width=True)
+    if df_curr.empty:
+        st.info("Keine Daten im gewählten Zeitraum/Filter – bitte Filter anpassen")
+    else:
+        ts = df_curr.groupby(pd.Grouper(key="date", freq="MS"), as_index=False).agg({"revenue":"sum","orders":"sum"})
+        if ts.empty or "date" not in ts.columns or "revenue" not in ts.columns:
+            st.info("Zeitreihenansicht nicht verfügbar für die aktuelle Auswahl")
+        else:
+            fig = px.line(ts, x="date", y="revenue", markers=True, title="Umsatz über Zeit")
+            fig.update_layout(yaxis_title="Umsatz (CHF)", xaxis_title="Monat")
+            st.plotly_chart(fig, use_container_width=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        by_reg = df_curr.groupby("region", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False)
-        st.subheader("Umsatz nach Region")
-        st.plotly_chart(px.bar(by_reg, x="region", y="revenue"), use_container_width=True)
-    with col2:
-        by_cat = df_curr.groupby("category", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False)
-        st.subheader("Umsatz nach Kategorie")
-        st.plotly_chart(px.bar(by_cat, x="category", y="revenue"), use_container_width=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            by_reg = df_curr.groupby("region", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False)
+            if by_reg.empty:
+                st.info("Keine Daten für Regionen")
+            else:
+                st.subheader("Umsatz nach Region")
+                st.plotly_chart(px.bar(by_reg, x="region", y="revenue"), use_container_width=True)
+        with col2:
+            by_cat = df_curr.groupby("category", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False)
+            if by_cat.empty:
+                st.info("Keine Daten für Kategorien")
+            else:
+                st.subheader("Umsatz nach Kategorie")
+                st.plotly_chart(px.bar(by_cat, x="category", y="revenue"), use_container_width=True)
 
 with tab2:
-    by_cat_month = df_curr.groupby([pd.Grouper(key="date", freq="MS"), "category"], as_index=False)["revenue"].sum()
-    st.plotly_chart(px.area(by_cat_month, x="date", y="revenue", color="category",
-                            title="Umsatz je Kategorie über Zeit"), use_container_width=True)
-
-    if "product" in df_curr.columns and not df_curr["product"].isna().all():
-        top_products = df_curr.groupby("product", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False).head(10)
-        st.subheader("Top 10 Produkte nach Umsatz")
-        st.plotly_chart(px.bar(top_products, x="product", y="revenue"), use_container_width=True)
+    if df_curr.empty:
+        st.info("Keine Daten für Kategorien-Drilldown")
+    else:
+        by_cat_month = df_curr.groupby([pd.Grouper(key="date", freq="MS"), "category"], as_index=False)["revenue"].sum()
+        if by_cat_month.empty:
+            st.info("Kein Kategorienverlauf für die Auswahl")
+        else:
+            st.plotly_chart(px.area(by_cat_month, x="date", y="revenue", color="category",
+                                    title="Umsatz je Kategorie über Zeit"), use_container_width=True)
+        if "product" in df_curr.columns and not df_curr["product"].isna().all():
+            top_products = df_curr.groupby("product", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False).head(10)
+            if not top_products.empty:
+                st.subheader("Top 10 Produkte nach Umsatz")
+                st.plotly_chart(px.bar(top_products, x="product", y="revenue"), use_container_width=True)
 
 with tab3:
-    by_channel = df_curr.groupby("channel", as_index=False)["revenue"].sum()
-    st.plotly_chart(px.pie(by_channel, names="channel", values="revenue", hole=0.5,
-                           title="Umsatzanteile nach Kanal"), use_container_width=True)
+    if df_curr.empty:
+        st.info("Keine Daten für Kanäle")
+    else:
+        by_channel = df_curr.groupby("channel", as_index=False)["revenue"].sum()
+        if by_channel.empty:
+            st.info("Keine Kanalumsätze für die Auswahl")
+        else:
+            st.plotly_chart(px.pie(by_channel, names="channel", values="revenue", hole=0.5,
+                                   title="Umsatzanteile nach Kanal"), use_container_width=True)
 
-    conv = df_curr.groupby("channel", as_index=False).agg({"orders":"sum"})
-    orders_sum = conv["orders"].replace(0, np.nan)
-    conv["avg_order_value"] = df_curr.groupby("channel")["revenue"].sum().values / orders_sum
-    conv = conv.fillna(0)
-    st.subheader("Bestellungen & Ø Bestellwert nach Kanal")
-    st.dataframe(conv.rename(columns={"orders":"Bestellungen","avg_order_value":"Ø Bestellwert"}))
+        conv = df_curr.groupby("channel", as_index=False).agg({"orders":"sum"})
+        if not conv.empty:
+            orders_sum = conv["orders"].replace(0, np.nan)
+            conv["avg_order_value"] = df_curr.groupby("channel")["revenue"].sum().values / orders_sum
+            conv = conv.fillna(0)
+            st.subheader("Bestellungen & Ø Bestellwert nach Kanal")
+            st.dataframe(conv.rename(columns={"orders":"Bestellungen","avg_order_value":"Ø Bestellwert"}))
 
 with tab4:
-    st.download_button("Gefilterte Daten als CSV", data=df_curr.to_csv(index=False).encode("utf-8"),
-                       file_name="filtered_data.csv", mime="text/csv")
-    st.dataframe(df_curr)
+    if df_curr.empty:
+        st.info("Keine Daten für Tabelle")
+    else:
+        st.download_button("Gefilterte Daten als CSV", data=df_curr.to_csv(index=False).encode("utf-8"),
+                           file_name="filtered_data.csv", mime="text/csv")
+        st.dataframe(df_curr)
 
-st.caption("Robuste Filter: Zeitraum & Auswahl werden auf vorhandene Daten begrenzt")
+st.caption("Tipp: Wenn Charts ausgeblendet sind, liegen keine Daten für die gewählten Filter vor")
