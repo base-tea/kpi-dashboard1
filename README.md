@@ -1,12 +1,8 @@
-# KPI-Dashboard mit Streamlit
+# KPI-Dashboard (erweitert)
+- Neue KPIs: Marge (optional via cost), MoM/YoY
+- Granularität: Monat oder Woche
+- Excel-Export mit mehreren Sheets
 
-## Lokaler Start
-- Python 3.10+ installiert
-- `pip install -r requirements.txt`
-- `streamlit run streamlit_dashboard.py`
-
-## Deployment auf Streamlit Community Cloud
-- Repo auf GitHub veröffentlichen
-- Auf https://streamlit.io/cloud mit GitHub einloggen
-- New app -> Repo + Branch wählen
-- Main file path: `streamlit_dashboard.py` -> Deploy
+## Start
+pip install -r requirements.txt
+streamlit run streamlit_dashboard.py

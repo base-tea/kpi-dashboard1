@@ -1,10 +1,12 @@
 # streamlit_dashboard.py
 # -*- coding: utf-8 -*-
 """
-KPI-Dashboard (robust gegen leere Filterergebnisse)
-- Überspringt Charts, wenn keine Daten im Zeitraum/Filter vorhanden
-- Setzt sichere Defaults für Widgets
-- Zeitraum wird auf Datenbereich begrenzt
+KPI-Dashboard (erweitert & robust)
+- Zusätzliche KPI: Marge (optional via cost-Spalte oder Annahme)
+- Wachstum: MoM und YoY
+- Granularität: Monat oder Woche
+- Export: Excel mit mehreren Sheets
+- Robuste Guards bei leeren Filterergebnissen
 """
 from __future__ import annotations
 import io
@@ -86,7 +88,17 @@ def try_read_csv(upload: bytes | None) -> pd.DataFrame | None:
     df["date"] = df["date"].apply(lambda x: parse_date(str(x)))
     df["orders"] = pd.to_numeric(df["orders"], errors="coerce").fillna(0).astype(int)
     df["revenue"] = pd.to_numeric(df["revenue"], errors="coerce").fillna(0.0)
+    if "cost" in df.columns:
+        df["cost"] = pd.to_numeric(df["cost"], errors="coerce").fillna(0.0)
     return df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+def ensure_profit_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if "cost" not in df.columns:
+        # einfache Annahme: 65% des Umsatzes als Kosten
+        df["cost"] = df["revenue"] * 0.65
+    df["margin"] = df["revenue"] - df["cost"]
+    df["margin_pct"] = np.where(df["revenue"] > 0, df["margin"] / df["revenue"] * 100, 0.0)
+    return df
 
 def filter_df(df: pd.DataFrame, d_from: pd.Timestamp, d_to: pd.Timestamp, regions, categories, channels) -> pd.DataFrame:
     m = (
@@ -104,18 +116,23 @@ def kpi_block(df_curr: pd.DataFrame, df_prev: pd.DataFrame):
     orders_prev = df_prev["orders"].sum()
     aov_curr = revenue_curr / orders_curr if orders_curr else 0
     aov_prev = revenue_prev / orders_prev if orders_prev else 0
+    margin_curr = df_curr.get("margin", pd.Series(dtype=float)).sum() if not df_curr.empty else 0.0
+    margin_prev = df_prev.get("margin", pd.Series(dtype=float)).sum() if not df_prev.empty else 0.0
+
     def delta_pct(curr, prev):
         if prev == 0:
             return 0.0 if curr == 0 else 100.0
         return (curr - prev) / prev * 100.0
-    c1, c2, c3, c4 = st.columns(4)
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Umsatz", fmt_chf(revenue_curr), f"{delta_pct(revenue_curr, revenue_prev):+.1f}%")
     c2.metric("Bestellungen", f"{orders_curr:,}".replace(",", "'"), f"{delta_pct(orders_curr, orders_prev):+.1f}%")
     c3.metric("Ø Bestellung", fmt_chf(aov_curr), f"{delta_pct(aov_curr, aov_prev):+.1f}%")
+    c4.metric("Marge", fmt_chf(margin_curr), f"{delta_pct(margin_curr, margin_prev):+.1f}%")
     if not df_curr.empty:
-        c4.metric("Periode", f"{df_curr['date'].min().date()} – {df_curr['date'].max().date()}")
+        c5.metric("Periode", f"{df_curr['date'].min().date()} – {df_curr['date'].max().date()}")
     else:
-        c4.metric("Periode", "keine Daten")
+        c5.metric("Periode", "keine Daten")
 
 # ------------------------------ App-Logik -------------------------------------
 st.sidebar.header("Datenquelle")
@@ -131,6 +148,9 @@ else:
 if df_raw is None or df_raw.empty:
     st.error("Keine gültigen Daten geladen")
     st.stop()
+
+# Profitspalten sicherstellen
+df_raw = ensure_profit_columns(df_raw)
 
 st.caption(f"Quelle: {source}")
 
@@ -158,7 +178,6 @@ else:
     d_from = pd.to_datetime(date_input_value)
     d_to   = pd.to_datetime(date_input_value)
 
-# sicheres Options-Setup
 regions_all = sorted(df_raw["region"].dropna().astype(str).unique().tolist()) if "region" in df_raw.columns else []
 categories_all = sorted(df_raw["category"].dropna().astype(str).unique().tolist()) if "category" in df_raw.columns else []
 channels_all = sorted(df_raw["channel"].dropna().astype(str).unique().tolist()) if "channel" in df_raw.columns else []
@@ -194,13 +213,31 @@ with tab1:
     if df_curr.empty:
         st.info("Keine Daten im gewählten Zeitraum/Filter – bitte Filter anpassen")
     else:
-        ts = df_curr.groupby(pd.Grouper(key="date", freq="MS"), as_index=False).agg({"revenue":"sum","orders":"sum"})
+        # Granularität
+        gran = st.radio("Granularität", ["Monat", "Woche"], horizontal=True)
+        freq = "MS" if gran == "Monat" else "W-MON"
+        ts = df_curr.groupby(pd.Grouper(key="date", freq=freq), as_index=False).agg({"revenue":"sum","orders":"sum","margin":"sum"})
         if ts.empty or "date" not in ts.columns or "revenue" not in ts.columns:
             st.info("Zeitreihenansicht nicht verfügbar für die aktuelle Auswahl")
         else:
-            fig = px.line(ts, x="date", y="revenue", markers=True, title="Umsatz über Zeit")
-            fig.update_layout(yaxis_title="Umsatz (CHF)", xaxis_title="Monat")
+            fig = px.line(ts, x="date", y="revenue", markers=True, title=f"Umsatz über Zeit – {gran}")
+            fig.update_layout(yaxis_title="Umsatz (CHF)", xaxis_title="Datum")
             st.plotly_chart(fig, use_container_width=True)
+
+        # MoM
+        ts_m = df_curr.groupby(pd.Grouper(key="date", freq="MS"), as_index=False).agg({"revenue":"sum"})
+        ts_m["revenue_lag1m"] = ts_m["revenue"].shift(1)
+        ts_m["mom_growth_pct"] = np.where(ts_m["revenue_lag1m"]>0, (ts_m["revenue"]-ts_m["revenue_lag1m"])/ts_m["revenue_lag1m"]*100, 0)
+
+        # YoY
+        ts_m["date_last_year"] = ts_m["date"] - pd.DateOffset(years=1)
+        yoy_lookup = ts_m[["date","revenue"]].rename(columns={"date":"date_last_year","revenue":"revenue_last_year"})
+        ts_yoy = ts_m.merge(yoy_lookup, on="date_last_year", how="left")
+        ts_yoy["yoy_growth_pct"] = np.where(ts_yoy["revenue_last_year"]>0,
+                                            (ts_yoy["revenue"]-ts_yoy["revenue_last_year"])/ts_yoy["revenue_last_year"]*100, 0)
+
+        with st.expander("MoM- und YoY-Wachstum (Monatsbasis)"):
+            st.dataframe(ts_yoy[["date","revenue","mom_growth_pct","revenue_last_year","yoy_growth_pct"]])
 
         col1, col2 = st.columns(2)
         with col1:
@@ -238,7 +275,7 @@ with tab3:
     if df_curr.empty:
         st.info("Keine Daten für Kanäle")
     else:
-        by_channel = df_curr.groupby("channel", as_index=False)["revenue"].sum()
+        by_channel = df_curr.groupby("channel", as_index=False).agg({"orders":"sum","revenue":"sum","margin":"sum"})
         if by_channel.empty:
             st.info("Keine Kanalumsätze für die Auswahl")
         else:
@@ -257,8 +294,21 @@ with tab4:
     if df_curr.empty:
         st.info("Keine Daten für Tabelle")
     else:
-        st.download_button("Gefilterte Daten als CSV", data=df_curr.to_csv(index=False).encode("utf-8"),
-                           file_name="filtered_data.csv", mime="text/csv")
+        # Excel-Export mit mehreren Sheets
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+            df_curr.to_excel(writer, sheet_name="Daten", index=False)
+            df_curr.groupby("region", as_index=False)["revenue"].sum().to_excel(writer, sheet_name="Regionen", index=False)
+            df_curr.groupby("category", as_index=False)["revenue"].sum().to_excel(writer, sheet_name="Kategorien", index=False)
+            df_curr.groupby("channel", as_index=False)["revenue"].sum().to_excel(writer, sheet_name="Kanäle", index=False)
+        st.download_button("Export als Excel", data=buf.getvalue(),
+                           file_name="export.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        st.download_button("Gefilterte Daten als CSV",
+                           data=df_curr.to_csv(index=False).encode("utf-8"),
+                           file_name="filtered_data.csv",
+                           mime="text/csv")
         st.dataframe(df_curr)
 
-st.caption("Tipp: Wenn Charts ausgeblendet sind, liegen keine Daten für die gewählten Filter vor")
+st.caption("Neue Features: Marge, MoM/YoY, Wochen/Monat-Umschalter, Excel-Export mit Tabs")
