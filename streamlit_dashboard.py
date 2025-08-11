@@ -1,12 +1,10 @@
 # streamlit_dashboard.py
 # -*- coding: utf-8 -*-
 """
-KPI-Dashboard (erweitert & robust)
-- Zusätzliche KPI: Marge (optional via cost-Spalte oder Annahme)
-- Wachstum: MoM und YoY
-- Granularität: Monat oder Woche
-- Export: Excel mit mehreren Sheets
-- Robuste Guards bei leeren Filterergebnissen
+KPI-Dashboard (Patch: stabile Zeitaggregation)
+- Verwendet resample(on="date") statt Grouper → garantiert Spalte "date"
+- Erzwingt datetime64[ns] für die Spalte "date"
+- Enthält erweiterte Features: Marge, MoM/YoY, Wochen/Monat, Excel-Export
 """
 from __future__ import annotations
 import io
@@ -94,7 +92,6 @@ def try_read_csv(upload: bytes | None) -> pd.DataFrame | None:
 
 def ensure_profit_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "cost" not in df.columns:
-        # einfache Annahme: 65% des Umsatzes als Kosten
         df["cost"] = df["revenue"] * 0.65
     df["margin"] = df["revenue"] - df["cost"]
     df["margin_pct"] = np.where(df["revenue"] > 0, df["margin"] / df["revenue"] * 100, 0.0)
@@ -149,6 +146,10 @@ if df_raw is None or df_raw.empty:
     st.error("Keine gültigen Daten geladen")
     st.stop()
 
+# Datentyp sicherstellen
+df_raw["date"] = pd.to_datetime(df_raw["date"], errors="coerce")
+df_raw = df_raw.dropna(subset=["date"])
+
 # Profitspalten sicherstellen
 df_raw = ensure_profit_columns(df_raw)
 
@@ -170,7 +171,6 @@ date_input_value = st.sidebar.date_input(
     max_value=max_date.date(),
 )
 
-# Vereinheitlichen
 if isinstance(date_input_value, (list, tuple)):
     d_from = pd.to_datetime(date_input_value[0])
     d_to   = pd.to_datetime(date_input_value[-1])
@@ -216,7 +216,8 @@ with tab1:
         # Granularität
         gran = st.radio("Granularität", ["Monat", "Woche"], horizontal=True)
         freq = "MS" if gran == "Monat" else "W-MON"
-        ts = df_curr.groupby(pd.Grouper(key="date", freq=freq), as_index=False).agg({"revenue":"sum","orders":"sum","margin":"sum"})
+        ts = df_curr.resample(freq, on="date").agg({"revenue":"sum","orders":"sum","margin":"sum"}).reset_index()
+
         if ts.empty or "date" not in ts.columns or "revenue" not in ts.columns:
             st.info("Zeitreihenansicht nicht verfügbar für die aktuelle Auswahl")
         else:
@@ -224,8 +225,8 @@ with tab1:
             fig.update_layout(yaxis_title="Umsatz (CHF)", xaxis_title="Datum")
             st.plotly_chart(fig, use_container_width=True)
 
-        # MoM
-        ts_m = df_curr.groupby(pd.Grouper(key="date", freq="MS"), as_index=False).agg({"revenue":"sum"})
+        # MoM auf Monatsbasis
+        ts_m = df_curr.resample("MS", on="date").agg({"revenue":"sum"}).reset_index()
         ts_m["revenue_lag1m"] = ts_m["revenue"].shift(1)
         ts_m["mom_growth_pct"] = np.where(ts_m["revenue_lag1m"]>0, (ts_m["revenue"]-ts_m["revenue_lag1m"])/ts_m["revenue_lag1m"]*100, 0)
 
@@ -259,11 +260,13 @@ with tab2:
     if df_curr.empty:
         st.info("Keine Daten für Kategorien-Drilldown")
     else:
-        by_cat_month = df_curr.groupby([pd.Grouper(key="date", freq="MS"), "category"], as_index=False)["revenue"].sum()
+        by_cat_month = (df_curr
+                        .assign(ym=df_curr["date"].dt.to_period("M").dt.to_timestamp())
+                        .groupby(["ym","category"], as_index=False)["revenue"].sum())
         if by_cat_month.empty:
             st.info("Kein Kategorienverlauf für die Auswahl")
         else:
-            st.plotly_chart(px.area(by_cat_month, x="date", y="revenue", color="category",
+            st.plotly_chart(px.area(by_cat_month, x="ym", y="revenue", color="category",
                                     title="Umsatz je Kategorie über Zeit"), use_container_width=True)
         if "product" in df_curr.columns and not df_curr["product"].isna().all():
             top_products = df_curr.groupby("product", as_index=False)["revenue"].sum().sort_values("revenue", ascending=False).head(10)
@@ -294,7 +297,6 @@ with tab4:
     if df_curr.empty:
         st.info("Keine Daten für Tabelle")
     else:
-        # Excel-Export mit mehreren Sheets
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             df_curr.to_excel(writer, sheet_name="Daten", index=False)
@@ -311,4 +313,4 @@ with tab4:
                            mime="text/csv")
         st.dataframe(df_curr)
 
-st.caption("Neue Features: Marge, MoM/YoY, Wochen/Monat-Umschalter, Excel-Export mit Tabs")
+st.caption("Zeitaggregation via resample(on='date') für maximale Kompatibilität")
